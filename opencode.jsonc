@@ -1,0 +1,20 @@
+{
+  "provider": {
+    "agentrouter-anthropic": {
+      "npm": "@ai-sdk/anthropic",
+      "options": {
+        "baseURL": "http://127.0.0.1:7187",
+        "apiKey": "sk-..."
+      },
+      "models": { "gpt-5.6-sol": { "name": "gpt-5.6-sol" } }
+    },
+    "agentrouter-openai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:7187/v1",
+        "apiKey": "sk-..."
+      },
+      "models": { "gpt-5.6-sol": { "name": "gpt-5.6-sol" } }
+    }
+  }
+}
