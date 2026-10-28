@@ -2,16 +2,11 @@
 """
 AgentRouter Anthropic-compatible proxy for OpenCode.
 
-Key policies:
-  • Single upstream request (no hidden retries that confuse client state).
-  • Protocol closure: every message_start emitted downstream is guaranteed to
-    be followed by content blocks and a final message_stop. Any upstream
-    truncation is repaired by synthesizing the missing tail.
-  • Message rollover: if upstream sends a new message_start before closing the
-    previous one, the proxy injects a message_stop for the old message first.
-  • Deferred start: message_start is held until the first content_block_start
-    is seen, preventing dangling starts on zero-content responses.
-  • Tool blocks are buffered and normalized into strict JSON objects.
+- Tolerates reused content_block indices (no hard fail on duplicates)
+- Emits tool_use start immediately; repairs tool JSON at stop
+- Forces stop_reason=tool_use when a tool was emitted
+- Maps upstream 502/503/504 HTML errors to short client messages
+- Clear stdout banner on startup; httpx2 with httpx fallback
 """
 
 from __future__ import annotations
@@ -21,45 +16,48 @@ import json
 import logging
 import os
 import queue
+import re
+import sys
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 import anthropic
-import httpx2
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+try:
+    import httpx2 as _httpx
+except ImportError:
+    import httpx as _httpx
 
 TARGET = os.environ.get("AGENTROUTER_BASE_URL", "https://agentrouter.org").rstrip("/")
 HOST = os.environ.get("AGENTROUTER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AGENTROUTER_PORT", "7187"))
 KEY_FILE = Path.home() / ".config/opencode/api_keys/AGENT_ROUTER_API_KEY"
-
 CONNECT_TIMEOUT = float(os.environ.get("AGENTROUTER_CONNECT_TIMEOUT", "15"))
 READ_TIMEOUT = float(os.environ.get("AGENTROUTER_READ_TIMEOUT", "900"))
 WRITE_TIMEOUT = float(os.environ.get("AGENTROUTER_WRITE_TIMEOUT", "30"))
 POOL_TIMEOUT = float(os.environ.get("AGENTROUTER_POOL_TIMEOUT", "10"))
 MODEL_ID = os.environ.get("AGENTROUTER_MODEL_ID", "gpt-5.6-sol")
+KEEP_CACHE_CONTROL = os.environ.get("AGENTROUTER_KEEP_CACHE_CONTROL", "0") == "1"
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    force=True,
 )
 logger = logging.getLogger("agentrouter-proxy")
 
-_HTTP_CLIENT = httpx2.Client(
-    limits=httpx2.Limits(
+_HTTP_CLIENT = _httpx.Client(
+    limits=_httpx.Limits(
         max_connections=int(os.environ.get("AGENTROUTER_MAX_CONNECTIONS", "50")),
         max_keepalive_connections=int(os.environ.get("AGENTROUTER_MAX_KEEPALIVE", "10")),
         keepalive_expiry=20.0,
     ),
-    timeout=httpx2.Timeout(
+    timeout=_httpx.Timeout(
         connect=CONNECT_TIMEOUT,
         read=READ_TIMEOUT,
         write=WRITE_TIMEOUT,
@@ -69,6 +67,12 @@ _HTTP_CLIENT = httpx2.Client(
 
 _app_client_lock = threading.Lock()
 _anthropic_client: anthropic.Anthropic | None = None
+
+_SDK_FIELDS = {
+    "model", "messages", "system", "max_tokens", "metadata", "stop_sequences",
+    "temperature", "top_k", "top_p", "tools", "tool_choice", "service_tier",
+}
+_HTML_RE = re.compile(r"<[^>]+>")
 
 
 class ProxyConfigurationError(RuntimeError):
@@ -81,9 +85,9 @@ def _read_server_key() -> str | None:
         return key
     try:
         if KEY_FILE.exists():
-            key = KEY_FILE.read_text(encoding="utf-8").strip()
-            if key:
-                return key
+            text = KEY_FILE.read_text(encoding="utf-8").strip()
+            if text:
+                return text
     except OSError as exc:
         logger.warning("Could not read API key file (%s)", type(exc).__name__)
     return None
@@ -109,16 +113,96 @@ def _get_client(request: Request | None = None) -> anthropic.Anthropic:
         return _anthropic_client
 
 
-# ---------------------------------------------------------------------------
-# Request normalization
-# ---------------------------------------------------------------------------
+def _friendly_upstream_error(exc: BaseException) -> str:
+    """Turn ALB HTML / SDK noise into a short message for OpenCode."""
+    status = getattr(exc, "status_code", None)
+    text = str(exc) or type(exc).__name__
+    low = text.lower()
+    body = getattr(exc, "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = body.decode("utf-8", errors="replace")
+            low = text.lower()
+        except Exception:
+            pass
+    elif isinstance(body, str) and body:
+        text = body
+        low = text.lower()
 
-_INTERNAL_REQUEST_FIELDS = {"stream"}
-_ALLOWED_TOP_LEVEL_FIELDS = {
-    "model", "messages", "system", "max_tokens", "metadata", "stop_sequences",
-    "stream", "temperature", "thinking", "output_config", "top_k", "top_p",
-    "tools", "tool_choice", "betas", "service_tier",
-}
+    if status == 504 or "504" in text or "gateway time-out" in low or "gateway timeout" in low:
+        return (
+            "Upstream AgentRouter timed out (504 Gateway Time-out). "
+            "Retry later, shorten the conversation context, or try another model."
+        )
+    if status == 502 or "502" in text or "bad gateway" in low:
+        return "Upstream AgentRouter bad gateway (502). Retry later."
+    if status == 503 or "503" in text or "service unavailable" in low:
+        return "Upstream AgentRouter unavailable (503). Retry later."
+    if status == 529 or "overloaded" in low:
+        return "Upstream model is overloaded. Retry later."
+    if "<html" in low or "<center>" in low:
+        plain = _HTML_RE.sub(" ", text)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        return (plain[:240] if plain else "Upstream returned an HTML error page.")
+    if isinstance(status, int) and status >= 400:
+        return f"Upstream HTTP {status}: {text[:300]}"
+    return text[:500]
+
+
+def _strip_block_cache(block: Any) -> Any:
+    if not isinstance(block, dict):
+        return block
+    out: dict[str, Any] = {}
+    for key, value in block.items():
+        if key == "cache_control":
+            continue
+        if key == "content" and isinstance(value, list):
+            out[key] = [
+                _strip_block_cache(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            out[key] = value
+    return out
+
+
+def _strip_cache_control(body: dict[str, Any]) -> None:
+    system = body.get("system")
+    if isinstance(system, list):
+        body["system"] = [
+            _strip_block_cache(item) if isinstance(item, dict) else item for item in system
+        ]
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        body["tools"] = [
+            _strip_block_cache(item) if isinstance(item, dict) else item for item in tools
+        ]
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    cleaned = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        msg = dict(msg)
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [
+                _strip_block_cache(item) if isinstance(item, dict) else item
+                for item in content
+            ]
+        cleaned.append(msg)
+    body["messages"] = cleaned
+
+
+def _normalize_thinking(thinking: Any) -> dict[str, Any] | None:
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return None
+    budget = thinking.get("budget_tokens")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        return None
+    return {"type": "enabled", "budget_tokens": budget}
 
 
 def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
@@ -128,334 +212,534 @@ def _normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Request field 'model' must be a non-empty string")
     if not isinstance(body.get("messages"), list):
         raise ValueError("Request field 'messages' must be an array")
-    if not isinstance(body.get("max_tokens"), int) or body["max_tokens"] < 1:
+    max_tokens = body.get("max_tokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
         raise ValueError("Request field 'max_tokens' must be a positive integer")
-
-    result = {
-        k: v for k, v in body.items()
-        if k not in _INTERNAL_REQUEST_FIELDS
-    }
     allow_unknown = os.environ.get("AGENTROUTER_ALLOW_UNKNOWN_FIELDS", "0") == "1"
-    if not allow_unknown:
-        result = {k: v for k, v in result.items() if k in _ALLOWED_TOP_LEVEL_FIELDS}
+    if allow_unknown:
+        result = {
+            k: v for k, v in body.items() if k not in {"stream", "betas", "output_config"}
+        }
+    else:
+        result = {k: v for k, v in body.items() if k in _SDK_FIELDS and v is not None}
+    thinking = _normalize_thinking(body.get("thinking"))
+    if thinking is not None:
+        result["thinking"] = thinking
+    if not KEEP_CACHE_CONTROL:
+        _strip_cache_control(result)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _extra_headers(request: Request, body: dict[str, Any]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    version = request.headers.get("anthropic-version")
+    if version:
+        headers["anthropic-version"] = version
+    betas: list[str] = []
+    header_beta = request.headers.get("anthropic-beta")
+    if header_beta:
+        betas.extend(part.strip() for part in header_beta.split(",") if part.strip())
+    raw = body.get("betas")
+    if isinstance(raw, str):
+        betas.extend(part.strip() for part in raw.split(",") if part.strip())
+    elif isinstance(raw, list):
+        betas.extend(item.strip() for item in raw if isinstance(item, str) and item.strip())
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for beta in betas:
+        if beta not in seen:
+            seen.add(beta)
+            ordered.append(beta)
+    if ordered:
+        headers["anthropic-beta"] = ",".join(ordered)
+    return headers
+
 
 def _new_message_id() -> str:
     return f"msg_{uuid.uuid4().hex}"
 
 
-def _repair_message_start(payload: dict[str, Any]) -> None:
-    if payload.get("type") != "message_start":
-        return
+def _coerce_token_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
+def _repair_message_start(payload: dict[str, Any], model: str) -> None:
     msg = payload.get("message")
     if not isinstance(msg, dict):
         msg = {}
         payload["message"] = msg
     if not isinstance(msg.get("id"), str) or not msg["id"]:
         msg["id"] = _new_message_id()
-    msg.setdefault("type", "message")
-    msg.setdefault("role", "assistant")
-    if not isinstance(msg.get("content"), list):
-        msg["content"] = []
+    msg["type"] = "message"
+    msg["role"] = "assistant"
+    msg["content"] = []
     if not isinstance(msg.get("model"), str) or not msg["model"]:
-        msg["model"] = MODEL_ID
-    if not isinstance(msg.get("usage"), dict):
-        msg["usage"] = {"input_tokens": 0, "output_tokens": 0}
-    else:
-        msg["usage"].setdefault("input_tokens", 0)
-        msg["usage"].setdefault("output_tokens", 0)
-    msg.setdefault("stop_reason", None)
-    msg.setdefault("stop_sequence", None)
+        msg["model"] = model
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    msg["usage"] = {
+        "input_tokens": _coerce_token_count(usage.get("input_tokens")),
+        "output_tokens": _coerce_token_count(usage.get("output_tokens")),
+    }
+    msg["stop_reason"] = None
+    msg["stop_sequence"] = None
 
 
-def _last_valid_json_object(text: str, max_candidates: int = 32) -> str | None:
-    if not text:
+def _json_points(text: str) -> list[tuple[int, str]]:
+    stack: list[str] = []
+    points: list[tuple[int, str]] = []
+    in_str = False
+    escape = False
+    index = 0
+    limit = len(text)
+
+    def closers() -> str:
+        return "".join(reversed(stack))
+
+    while index < limit:
+        ch = text[index]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+                look = index + 1
+                while look < limit and text[look] in " \t\r\n":
+                    look += 1
+                if look >= limit or text[look] != ":":
+                    points.append((index + 1, closers()))
+            index += 1
+            continue
+        if ch == '"':
+            in_str = True
+            index += 1
+            continue
+        if ch == "{":
+            stack.append("}")
+            index += 1
+            continue
+        if ch == "[":
+            stack.append("]")
+            index += 1
+            continue
+        if ch in "}]":
+            if not stack or stack[-1] != ch:
+                break
+            stack.pop()
+            points.append((index + 1, closers()))
+            index += 1
+            continue
+        literal_end = None
+        if text.startswith("true", index):
+            literal_end = index + 4
+        elif text.startswith("false", index):
+            literal_end = index + 5
+        elif text.startswith("null", index):
+            literal_end = index + 4
+        elif ch == "-" or ch.isdigit():
+            literal_end = index + 1
+            while literal_end < limit and text[literal_end] in "0123456789+-.eE":
+                literal_end += 1
+        if literal_end is not None:
+            points.append((literal_end, closers()))
+            index = literal_end
+            continue
+        index += 1
+    return points
+
+
+def _best_json_object(text: str) -> dict[str, Any] | None:
+    raw = text.strip()
+    if not raw:
         return None
-    opens = [i for i, ch in enumerate(text) if ch == "{"]
-    closes = [i for i, ch in enumerate(text) if ch == "}"]
-    tried = 0
-    for i in range(len(opens) - 1, -1, -1):
-        if tried >= max_candidates: break
-        tried += 1
-        candidate = text[opens[i]:]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict): return candidate
-        except (json.JSONDecodeError, ValueError): continue
-    tried = 0
-    for i in range(len(closes) - 1, -1, -1):
-        if tried >= max_candidates: break
-        tried += 1
-        candidate = text[: closes[i] + 1]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict): return candidate
-        except (json.JSONDecodeError, ValueError): continue
-    return None
-
-
-def _parse_tool_input(raw: str) -> dict[str, Any] | None:
-    if not raw or not raw.strip():
-        return {}
-    trimmed = raw.strip()
+    brace = raw.find("{")
+    if brace > 0:
+        raw = raw[brace:]
     try:
-        parsed = json.loads(trimmed)
-        if isinstance(parsed, dict): return parsed
-    except (json.JSONDecodeError, ValueError): pass
-    repaired = _last_valid_json_object(trimmed)
-    if repaired is not None:
-        try:
-            parsed = json.loads(repaired)
-            if isinstance(parsed, dict): return parsed
-        except (json.JSONDecodeError, ValueError): pass
-    return None
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    points = _json_points(raw)
+    if not points:
+        return None
+    end, closers = points[-1]
+    if raw[end:].strip("` \t\r\n,}]"):
+        return None
+    candidate = raw[:end].rstrip().rstrip(",") + closers
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
 
 
-# ---------------------------------------------------------------------------
-# Stream State Machine
-# ---------------------------------------------------------------------------
+def _json_object(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
 
 class StreamRepairState:
-    def __init__(self) -> None:
-        self.pending_message_start: dict[str, Any] | None = None
-        self.committed = False
-        self.open_msg_id: str | None = None
+    def __init__(self, model: str | None = None) -> None:
+        self.model = model or MODEL_ID
+        self.started = False
         self.finished = False
         self.failed = False
-        self.saw_stop_reason = False
-
-        self.pending_tool_events: list[dict[str, Any]] | None = None
-        self.pending_tool_index: int | None = None
+        self.any_block_emitted = False
+        self.emitted_tool = False
+        self.stop_reason: str | None = None
+        self.stop_sequence: str | None = None
+        self.usage = {"input_tokens": 0, "output_tokens": 0}
         self.seen_block_indices: set[int] = set()
-        self.active_block_indices: set[int] = set()
-        self._tool_flushed_ok = False
+        self.active_blocks: dict[int, str] = {}
+        self.index_remap: dict[int, int] = {}
+        self.tool_buf: dict[str, Any] | None = None
 
     def process(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(payload, dict) or self.failed:
             return []
-        etype = payload.get("type")
-
-        # --- Tool block buffering ---
-        if self.pending_tool_events is not None:
-            if etype == "content_block_delta":
-                if payload.get("index") != self.pending_tool_index:
-                    return self._fail("tool block index changed")
-                self.pending_tool_events.append(payload)
-                return []
-            if etype == "content_block_stop":
-                if payload.get("index") != self.pending_tool_index:
-                    return self._fail("tool stop index mismatch")
-                self.pending_tool_events.append(payload)
-                return self._flush_tool_block()
-            return self._fail(f"unexpected {etype!r} before tool block stopped")
-
-        if self.finished and etype != "message_start":
-            return []
-        if self.finished and etype == "message_start":
-            self.finished = False
-
-        # --- Message Lifecycle ---
-        if etype == "message_start":
-            _repair_message_start(payload)
-            new_id = payload["message"]["id"]
-            
-            out: list[dict[str, Any]] = []
-            if self.open_msg_id is not None:
-                if new_id == self.open_msg_id:
-                    return []  # dup
-                # Upstream opened a new message without closing the old one.
-                # Force close the old one downstream.
-                out.extend(self._close_open_message_forcibly())
-            
-            self.open_msg_id = new_id
-            self.saw_stop_reason = False
-            self.seen_block_indices.clear()
-            self.active_block_indices.clear()
-            self._tool_flushed_ok = False
-
-            if not self.committed:
-                # Buffer the start until we see an actual content block
-                self.pending_message_start = payload
-                return []
-            
-            out.append(payload)
-            return out
-
-        if etype == "error":
-            self.failed = True
-            return [payload]
-
-        if self.open_msg_id is None:
-            return []
-
-        # --- Content Blocks ---
-        if etype == "content_block_start":
-            idx = payload.get("index")
-            block = payload.get("content_block")
-            if not isinstance(idx, int) or idx < 0 or not isinstance(block, dict):
-                return self._fail("content_block_start invalid")
-            if idx in self.seen_block_indices:
-                return self._fail(f"duplicate content block index {idx}")
-            
-            self.seen_block_indices.add(idx)
-            self.active_block_indices.add(idx)
-
-            if block.get("type") == "thinking" and not isinstance(block.get("thinking"), str):
-                block["thinking"] = ""
-
-            out: list[dict[str, Any]] = []
-            if not self.committed:
-                if self.pending_message_start is not None:
-                    out.append(self.pending_message_start)
-                    self.pending_message_start = None
-                self.committed = True
-
-            if block.get("type") == "tool_use":
-                if not isinstance(block.get("id"), str) or not block["id"]:
-                    block["id"] = f"toolu_{uuid.uuid4().hex}"
-                if not isinstance(block.get("name"), str) or not block["name"]:
-                    return self._fail(f"tool_use at {idx} missing name")
-                self.pending_tool_events = [payload]
-                self.pending_tool_index = idx
-                # Note: we do NOT return [payload] here because the tool block 
-                # is buffered. But we MUST return the message_start if we just committed.
-                return out
-
-            out.append(payload)
-            return out
-
-        if etype == "content_block_delta":
-            idx = payload.get("index")
-            if idx not in self.active_block_indices:
-                return []
-            return [payload]
-
-        if etype == "content_block_stop":
-            idx = payload.get("index")
-            if idx in self.active_block_indices:
-                self.active_block_indices.remove(idx)
-                return [payload]
-            return []
-
-        if etype == "message_delta":
-            delta = payload.get("delta")
-            if not isinstance(delta, dict):
-                return []
-            if delta.get("stop_reason") is not None:
-                self.saw_stop_reason = True
-            return [payload]
-
-        if etype == "message_stop":
-            self.open_msg_id = None
-            self.finished = True
-            return [payload]
-
-        return [payload]
+        out: list[dict[str, Any]] = []
+        pending: dict[str, Any] | None = payload
+        for _ in range(8):
+            if pending is None:
+                break
+            events, pending = self._step(pending)
+            out.extend(events)
+        return out
 
     def finalize(self) -> list[dict[str, Any]]:
-        """Flush any dangling state and guarantee a closed stream."""
+        if self.failed or self.finished:
+            return []
+        return self._close_message()
+
+    def _step(
+        self, payload: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if self.finished or self.failed:
+            return [], None
+        etype = payload.get("type")
+
+        if self.tool_buf is not None:
+            if etype == "ping":
+                return [{"type": "ping"}], None
+            if not self._is_tool_continuation(payload):
+                return self._flush_tool(), payload
+            return self._buffer_tool_event(payload), None
+
+        if etype == "ping":
+            return ([{"type": "ping"}], None) if self.started else ([], None)
+        if etype == "error":
+            return self._on_error(payload), None
+        if etype == "message_start":
+            if self.started:
+                logger.warning("dropping extra message_start")
+                return self._close_message(), None
+            _repair_message_start(payload, self.model)
+            self.started = True
+            self._merge_usage(payload["message"].get("usage"))
+            return [payload], None
+        if not self.started:
+            if etype in {
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            }:
+                return self._ensure_started(), payload
+            return [], None
+        if etype == "message_delta":
+            return self._on_message_delta(payload), None
+        if etype == "message_stop":
+            return self._close_message(), None
+        if etype == "content_block_start":
+            return self._on_block_start(payload), None
+        if etype == "content_block_delta":
+            return self._on_block_delta(payload), None
+        if etype == "content_block_stop":
+            return self._on_block_stop(payload), None
+        return [], None
+
+    def _ensure_started(self) -> list[dict[str, Any]]:
+        if self.started:
+            return []
+        payload: dict[str, Any] = {"type": "message_start", "message": {}}
+        _repair_message_start(payload, self.model)
+        self.started = True
+        return [payload]
+
+    def _merge_usage(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        for key in ("input_tokens", "output_tokens"):
+            if key in usage:
+                self.usage[key] = _coerce_token_count(usage.get(key))
+
+    def _final_stop_reason(self) -> str:
+        if self.emitted_tool and self.stop_reason in (None, "end_turn"):
+            return "tool_use"
+        if isinstance(self.stop_reason, str) and self.stop_reason:
+            return self.stop_reason
+        return "end_turn"
+
+    def _close_open_blocks(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        for index in sorted(self.active_blocks):
+            out.append({"type": "content_block_stop", "index": index})
+        self.active_blocks.clear()
+        return out
 
-        if self.pending_tool_events is not None:
-            out.extend(self._flush_tool_block(allow_missing_stop=True))
-
-        # If we have a buffered start but never committed it, emit an empty message.
-        if not self.committed and self.pending_message_start is not None:
-            out.append(self.pending_message_start)
-            out.append({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+    def _close_message(self) -> list[dict[str, Any]]:
+        if self.finished:
+            return []
+        out = self._ensure_started()
+        if self.tool_buf is not None:
+            out.extend(self._flush_tool())
+        out.extend(self._close_open_blocks())
+        if not self.any_block_emitted:
+            out.append(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            )
             out.append({"type": "content_block_stop", "index": 0})
-            self.pending_message_start = None
-            self.committed = True
-
-        # If a message is still open, close it now.
-        if self.open_msg_id is not None:
-            if not self.saw_stop_reason:
-                out.append({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"input_tokens": 10, "output_tokens": 10},
-                })
-            out.append({"type": "message_stop"})
-            self.open_msg_id = None
-            self.finished = True
-
-        return out
-
-    def _close_open_message_forcibly(self) -> list[dict[str, Any]]:
-        if self.open_msg_id is None: return []
-        out: list[dict[str, Any]] = []
-        if self.pending_tool_events is not None:
-            out.extend(self._flush_tool_block(allow_missing_stop=True))
-        
-        if not self.saw_stop_reason:
-            out.append({
+            self.any_block_emitted = True
+        out.append(
+            {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {"input_tokens": 10, "output_tokens": 10},
-            })
+                "delta": {
+                    "stop_reason": self._final_stop_reason(),
+                    "stop_sequence": self.stop_sequence,
+                },
+                "usage": {
+                    "input_tokens": self.usage.get("input_tokens", 0),
+                    "output_tokens": self.usage.get("output_tokens", 0),
+                },
+            }
+        )
         out.append({"type": "message_stop"})
-        
-        self.open_msg_id = None
-        self.active_block_indices.clear()
-        self.seen_block_indices.clear()
+        self.finished = True
         return out
 
-    def _fail(self, msg: str) -> list[dict[str, Any]]:
+    def _on_error(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.started and self.any_block_emitted:
+            logger.error(
+                "upstream error after content, closing message: %s", payload.get("error")
+            )
+            return self._close_message()
         self.failed = True
-        logger.error("Stream protocol error: %s", msg)
-        return [{"type": "error", "error": {"type": "api_error", "message": msg}}]
-
-    def _flush_tool_block(self, *, allow_missing_stop: bool = False) -> list[dict[str, Any]]:
-        events = self.pending_tool_events or []
-        self.pending_tool_events = None
-        self.pending_tool_index = None
-
-        start_event = next((e for e in events if e.get("type") == "content_block_start"), None)
-        stop_event = next((e for e in events if e.get("type") == "content_block_stop"), None)
-        
-        if start_event is None:
-            return self._fail("tool block missing start")
-
-        idx = start_event["index"]
-        block = start_event["content_block"]
-        partials: list[str] = []
-        for ev in events:
-            if ev.get("type") == "content_block_delta":
-                d = ev.get("delta")
-                if isinstance(d, dict) and d.get("type") == "input_json_delta":
-                    p = d.get("partial_json", "")
-                    if isinstance(p, str): partials.append(p)
-
-        raw = "".join(partials)
-        parsed = _parse_tool_input(raw)
-        if parsed is None and isinstance(block.get("input"), dict):
-            parsed = block["input"]
-        if parsed is None:
-            parsed = {}
-
-        new_block = dict(block)
-        new_block["input"] = {}
-        self.active_block_indices.discard(idx)
-        self._tool_flushed_ok = True
-        
-        if stop_event is None:
-            stop_event = {"type": "content_block_stop", "index": idx}
-
+        err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
         return [
-            {"type": "content_block_start", "index": idx, "content_block": new_block},
-            {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))}},
-            stop_event,
+            {
+                "type": "error",
+                "error": {
+                    "type": str(err.get("type") or "api_error"),
+                    "message": str(err.get("message") or "upstream error"),
+                },
+            }
         ]
 
+    def _is_tool_continuation(self, payload: dict[str, Any]) -> bool:
+        if self.tool_buf is None:
+            return False
+        etype = payload.get("type")
+        if etype not in {"content_block_delta", "content_block_stop"}:
+            return False
+        upstream = payload.get("index")
+        idx = self.index_remap.get(upstream, upstream)
+        return idx == self.tool_buf["index"]
 
-# ---------------------------------------------------------------------------
-# SSE Parser & Worker
-# ---------------------------------------------------------------------------
+    def _on_block_start(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        upstream = payload.get("index")
+        block = payload.get("content_block")
+        if (
+            not isinstance(upstream, int)
+            or isinstance(upstream, bool)
+            or upstream < 0
+            or not isinstance(block, dict)
+        ):
+            return []
+
+        out: list[dict[str, Any]] = []
+        mapped = self.index_remap.get(upstream)
+        if mapped is not None and mapped in self.active_blocks:
+            logger.warning(
+                "force-closing open content block index %s before reuse", mapped
+            )
+            out.append({"type": "content_block_stop", "index": mapped})
+            self.active_blocks.pop(mapped, None)
+            idx = mapped
+        elif mapped is not None or upstream in self.seen_block_indices:
+            idx = (max(self.seen_block_indices) + 1) if self.seen_block_indices else 0
+            logger.warning(
+                "remapping reused content block index %s -> %s", upstream, idx
+            )
+        else:
+            idx = upstream
+
+        self.index_remap[upstream] = idx
+        self.seen_block_indices.add(idx)
+        payload = dict(payload)
+        payload["index"] = idx
+
+        block_type = block.get("type")
+        if block_type not in {"text", "thinking", "redacted_thinking", "tool_use"}:
+            return out
+
+        if block_type == "tool_use":
+            tool_id = (
+                block.get("id")
+                if isinstance(block.get("id"), str) and block.get("id")
+                else f"toolu_{uuid.uuid4().hex}"
+            )
+            tool_name = block.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                return out
+            fallback = block.get("input")
+            if isinstance(fallback, str):
+                fallback = _best_json_object(fallback)
+            if not isinstance(fallback, dict) or not fallback:
+                fallback = None
+            self.tool_buf = {"index": idx, "parts": [], "fallback": fallback}
+            self.active_blocks[idx] = "tool_use"
+            self.any_block_emitted = True
+            out.append(
+                {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {},
+                    },
+                }
+            )
+            return out
+
+        if block_type == "text" and not isinstance(block.get("text"), str):
+            block["text"] = ""
+        if block_type == "thinking" and not isinstance(block.get("thinking"), str):
+            block["thinking"] = ""
+        if block_type == "redacted_thinking" and not isinstance(block.get("data"), str):
+            block["data"] = ""
+        self.active_blocks[idx] = str(block_type)
+        self.any_block_emitted = True
+        out.append(payload)
+        return out
+
+    def _buffer_tool_event(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        assert self.tool_buf is not None
+        etype = payload.get("type")
+        if etype == "content_block_delta":
+            delta = payload.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
+                part = delta.get("partial_json", "")
+                self.tool_buf["parts"].append(
+                    part if isinstance(part, str) else str(part)
+                )
+            return []
+        if etype == "content_block_stop":
+            return self._flush_tool()
+        return []
+
+    def _flush_tool(self) -> list[dict[str, Any]]:
+        buf = self.tool_buf
+        self.tool_buf = None
+        if buf is None:
+            return []
+        index = buf["index"]
+        self.active_blocks.pop(index, None)
+        raw = "".join(buf["parts"])
+        if raw.strip():
+            parsed = _best_json_object(raw)
+            partial = _json_object(parsed) if parsed is not None else raw
+        elif isinstance(buf.get("fallback"), dict):
+            partial = _json_object(buf["fallback"])
+        else:
+            partial = "{}"
+        self.emitted_tool = True
+        self.any_block_emitted = True
+        return [
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": partial},
+            },
+            {"type": "content_block_stop", "index": index},
+        ]
+
+    def _on_block_delta(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        upstream = payload.get("index")
+        idx = self.index_remap.get(upstream, upstream)
+        if idx not in self.active_blocks:
+            return []
+        if idx != upstream:
+            payload = dict(payload)
+            payload["index"] = idx
+        delta = payload.get("delta")
+        if not isinstance(delta, dict):
+            return []
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            if not isinstance(delta.get("text"), str):
+                delta["text"] = (
+                    "" if delta.get("text") is None else str(delta.get("text"))
+                )
+            return [payload]
+        if dtype == "thinking_delta":
+            if not isinstance(delta.get("thinking"), str):
+                delta["thinking"] = (
+                    ""
+                    if delta.get("thinking") is None
+                    else str(delta.get("thinking"))
+                )
+            return [payload]
+        if dtype == "signature_delta" and isinstance(delta.get("signature"), str):
+            return [payload]
+        if dtype == "input_json_delta":
+            if not isinstance(delta.get("partial_json"), str):
+                delta["partial_json"] = (
+                    ""
+                    if delta.get("partial_json") is None
+                    else str(delta.get("partial_json"))
+                )
+            return [payload]
+        return []
+
+    def _on_block_stop(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        upstream = payload.get("index")
+        idx = self.index_remap.get(upstream, upstream)
+        block_type = self.active_blocks.pop(idx, None)
+        if block_type is None:
+            return []
+        if block_type == "tool_use":
+            self.emitted_tool = True
+        if idx != upstream:
+            payload = dict(payload)
+            payload["index"] = idx
+        return [payload]
+
+    def _on_message_delta(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        delta = payload.get("delta")
+        out = self._close_open_blocks()
+        if isinstance(delta, dict):
+            reason = delta.get("stop_reason")
+            if isinstance(reason, str) and reason:
+                self.stop_reason = reason
+            if "stop_sequence" in delta:
+                seq = delta.get("stop_sequence")
+                self.stop_sequence = seq if isinstance(seq, str) else None
+            if self.emitted_tool and self.stop_reason in (None, "end_turn"):
+                self.stop_reason = "tool_use"
+        self._merge_usage(payload.get("usage"))
+        return out
+
 
 def _parse_sse_events(chunks: Iterator[bytes]) -> Iterator[tuple[str | None, str]]:
     buffer = ""
@@ -464,14 +748,16 @@ def _parse_sse_events(chunks: Iterator[bytes]) -> Iterator[tuple[str | None, str
 
     def dispatch():
         nonlocal current_event, data_lines
-        if not data_lines and current_event is None: return None
+        if not data_lines and current_event is None:
+            return None
         item = (current_event, "\n".join(data_lines))
         current_event = None
         data_lines = []
         return item
 
     for chunk in chunks:
-        if not chunk: continue
+        if not chunk:
+            continue
         buffer += chunk.decode("utf-8", errors="replace")
         while True:
             line_end = None
@@ -482,27 +768,36 @@ def _parse_sse_events(chunks: Iterator[bytes]) -> Iterator[tuple[str | None, str
                         break
                     line_end = i
                     break
-            if line_end is None: break
+            if line_end is None:
+                break
             line = buffer[:line_end]
-            delim = 2 if buffer[line_end:line_end + 2] == "\r\n" else 1
-            buffer = buffer[line_end + delim:]
+            delim = 2 if buffer[line_end : line_end + 2] == "\r\n" else 1
+            buffer = buffer[line_end + delim :]
             if line == "":
                 ev = dispatch()
-                if ev is not None: yield ev
+                if ev is not None:
+                    yield ev
                 continue
-            if line.startswith(":"): continue
+            if line.startswith(":"):
+                continue
             field, sep, value = line.partition(":")
-            if not sep: value = ""
-            elif value.startswith(" "): value = value[1:]
-            if field == "event": current_event = value
-            elif field == "data": data_lines.append(value)
-
+            if not sep:
+                value = ""
+            elif value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                current_event = value
+            elif field == "data":
+                data_lines.append(value)
     if buffer:
         line = buffer.rstrip("\r\n")
-        if line.startswith("event:"): current_event = line[6:].lstrip(" ")
-        elif line.startswith("data:"): data_lines.append(line[5:].lstrip(" "))
+        if line.startswith("event:"):
+            current_event = line[6:].lstrip(" ")
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
     ev = dispatch()
-    if ev is not None: yield ev
+    if ev is not None:
+        yield ev
 
 
 def _sse_frame(payload: dict[str, Any]) -> bytes:
@@ -513,108 +808,190 @@ def _sse_frame(payload: dict[str, Any]) -> bytes:
     return f"data: {data}\n\n".encode()
 
 
-def _stream_worker(kw: dict[str, Any], out_q: queue.Queue, request: Request) -> None:
-    state = StreamRepairState()
+def _handle_upstream_event(
+    state: StreamRepairState, event_name: str | None, raw_data: str
+) -> list[dict[str, Any]]:
+    if event_name == "billing_summary":
+        return []
+    if not raw_data:
+        return state.process({"type": "ping"}) if event_name == "ping" else []
+    if raw_data.strip() == "[DONE]":
+        return []
     try:
-        client = _get_client(request)
-        with client.messages.with_streaming_response.create(**kw) as resp:
-            for event_name, raw_data in _parse_sse_events(resp.iter_bytes(chunk_size=4096)):
-                if event_name == "billing_summary": continue
-                if not raw_data: continue
-                try:
-                    payload = json.loads(raw_data)
-                except (json.JSONDecodeError, ValueError):
-                    if raw_data.strip() == "[DONE]": continue
-                    raise ValueError("non-JSON payload")
-                if not isinstance(payload, dict):
-                    raise ValueError("payload not object")
-                if not payload.get("type") and event_name:
-                    payload["type"] = event_name
-                
-                for repaired in state.process(payload):
+        payload = json.loads(raw_data)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("non-JSON payload")
+    if not isinstance(payload, dict):
+        raise ValueError("payload not object")
+    if not payload.get("type") and event_name:
+        payload["type"] = event_name
+    if payload.get("type") == "billing_summary":
+        return []
+    return state.process(payload)
+
+
+def _stream_worker(
+    kw: dict[str, Any], extra_headers: dict[str, str], out_q: queue.Queue
+) -> None:
+    state = StreamRepairState(
+        model=kw.get("model") if isinstance(kw.get("model"), str) else None
+    )
+    try:
+        client = _get_client()
+        call_kw = dict(kw)
+        if extra_headers:
+            call_kw["extra_headers"] = extra_headers
+        with client.messages.with_streaming_response.create(**call_kw) as resp:
+            for event_name, raw_data in _parse_sse_events(
+                resp.iter_bytes(chunk_size=4096)
+            ):
+                for repaired in _handle_upstream_event(state, event_name, raw_data):
                     out_q.put(_sse_frame(repaired))
                 if state.failed:
                     return
-
-        # Stream ended naturally. Finalize to close any dangling frames.
         for tail in state.finalize():
             out_q.put(_sse_frame(tail))
-            
     except Exception as exc:
-        logger.exception("stream worker failed: %s", exc)
-        # Ensure we push an error if we haven't committed, or just try to close gracefully.
-        if not state.committed:
-            out_q.put(_sse_frame({"type": "error", "error": {"type": "api_error", "message": str(exc)}}))
-        else:
-            # If we already committed (client is reading), we must send a valid stop to prevent UI hanging.
-            out_q.put(_sse_frame({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"input_tokens": 0, "output_tokens": 0}}))
-            out_q.put(_sse_frame({"type": "message_stop"}))
+        msg = _friendly_upstream_error(exc)
+        logger.error("stream worker failed: %s", msg)
+        if not state.failed:
+            if not state.started:
+                out_q.put(
+                    _sse_frame(
+                        {
+                            "type": "error",
+                            "error": {"type": "api_error", "message": msg},
+                        }
+                    )
+                )
+            else:
+                for tail in state.finalize():
+                    out_q.put(_sse_frame(tail))
     finally:
         out_q.put(None)
 
 
-async def _stream_gen(kw: dict[str, Any], request: Request):
+async def _stream_gen(kw: dict[str, Any], extra_headers: dict[str, str]):
     q: queue.Queue = queue.Queue()
-    t = threading.Thread(target=_stream_worker, args=(kw, q, request), daemon=True)
-    t.start()
+    threading.Thread(
+        target=_stream_worker, args=(kw, extra_headers, q), daemon=True
+    ).start()
     loop = asyncio.get_running_loop()
     while True:
         try:
-            item = await asyncio.wait_for(loop.run_in_executor(None, q.get), timeout=READ_TIMEOUT + 5)
+            item = await asyncio.wait_for(
+                loop.run_in_executor(None, q.get), timeout=READ_TIMEOUT + 5
+            )
         except asyncio.TimeoutError:
-            yield _sse_frame({"type": "error", "error": {"type": "api_error", "message": "proxy timeout"}})
+            yield _sse_frame(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "proxy timeout waiting for upstream stream",
+                    },
+                }
+            )
             return
-        if item is None: return
+        if item is None:
+            return
         yield item
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+app = FastAPI(title="AgentRouter Anthropic Proxy", version="5.1.1")
 
-app = FastAPI(title="AgentRouter Anthropic Proxy", version="4.0.0")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "upstream": TARGET}
+    return {
+        "status": "ok",
+        "upstream": TARGET,
+        "listen": f"{HOST}:{PORT}",
+        "model_id": MODEL_ID,
+    }
+
 
 @app.get("/v1/models")
 @app.get("/models")
 async def models():
     return {"object": "list", "data": [{"id": MODEL_ID, "object": "model"}]}
 
+
 @app.post("/v1/messages")
 @app.post("/messages")
 async def messages(request: Request):
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Request JSON body must be an object")
+        extra_headers = _extra_headers(request, body)
         kw = _normalize_request(body)
     except (ValueError, json.JSONDecodeError) as exc:
-        return JSONResponse(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+        return JSONResponse(
+            400,
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
 
     if body.get("stream", False):
         kw["stream"] = True
 
         async def safe():
-            async for chunk in _stream_gen(kw, request):
+            async for chunk in _stream_gen(kw, extra_headers):
                 yield chunk
 
         return StreamingResponse(
             safe(),
             media_type="text/event-stream",
-            headers={"cache-control": "no-cache", "x-accel-buffering": "no", "connection": "keep-alive"},
+            headers={
+                "cache-control": "no-cache",
+                "x-accel-buffering": "no",
+                "connection": "keep-alive",
+            },
         )
 
     try:
         client = _get_client(request)
-        msg = await asyncio.to_thread(lambda: client.messages.create(**kw))
+        call_kw = dict(kw)
+        if extra_headers:
+            call_kw["extra_headers"] = extra_headers
+        msg = await asyncio.to_thread(lambda: client.messages.create(**call_kw))
         return Response(content=msg.model_dump_json(), media_type="application/json")
     except anthropic.APIStatusError as exc:
-        body_val = getattr(exc, "body", None)
-        return JSONResponse(exc.status_code, body_val if isinstance(body_val, dict) else {"type": "error", "error": {"type": "api_error", "message": str(body_val or exc)}})
+        msg = _friendly_upstream_error(exc)
+        status = getattr(exc, "status_code", 502) or 502
+        return JSONResponse(
+            status,
+            {"type": "error", "error": {"type": "api_error", "message": msg}},
+        )
     except Exception as exc:
-        return JSONResponse(502, {"type": "error", "error": {"type": "api_error", "message": str(exc)}})
+        return JSONResponse(
+            502,
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": _friendly_upstream_error(exc),
+                },
+            },
+        )
+
 
 if __name__ == "__main__":
-    logger.info("AgentRouter proxy -> %s", TARGET)
-    uvicorn.run(app, host=HOST, port=PORT, log_level=os.environ.get("UVICORN_LOG_LEVEL", "warning").lower())
+    print(f"AgentRouter proxy starting on http://{HOST}:{PORT}", flush=True)
+    print(f"  upstream : {TARGET}", flush=True)
+    print(f"  model id : {MODEL_ID}", flush=True)
+    print(f"  health   : http://{HOST}:{PORT}/health", flush=True)
+    logger.info("AgentRouter proxy -> %s (listen %s:%s)", TARGET, HOST, PORT)
+    try:
+        uvicorn.run(
+            app,
+            host=HOST,
+            port=PORT,
+            log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
+        )
+    except OSError as exc:
+        print(f"Failed to bind {HOST}:{PORT}: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
