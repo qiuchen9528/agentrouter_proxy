@@ -6,6 +6,8 @@ AgentRouter Anthropic-compatible proxy for OpenCode.
 - Emits tool_use start immediately; repairs tool JSON at stop
 - Forces stop_reason=tool_use when a tool was emitted
 - Maps upstream 502/503/504 HTML errors to short client messages
+- Parallel tool_use: concurrent buffers per index (no cross-merge)
+- Tool JSON: take first complete object if model concatenates {...}{...}
 - Clear stdout banner on startup; httpx2 with httpx fallback
 """
 
@@ -352,12 +354,26 @@ def _json_points(text: str) -> list[tuple[int, str]]:
 
 
 def _best_json_object(text: str) -> dict[str, Any] | None:
+    """Extract the first complete JSON object.
+
+    Models sometimes concatenate parallel tool args as ``{...}{...}``.
+    Prefer the first valid object over returning the whole illegal string.
+    """
     raw = text.strip()
     if not raw:
         return None
     brace = raw.find("{")
+    if brace < 0:
+        return None
     if brace > 0:
         raw = raw[brace:]
+    # Exact or trailing-extra: take first object only.
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
@@ -367,15 +383,37 @@ def _best_json_object(text: str) -> dict[str, Any] | None:
     points = _json_points(raw)
     if not points:
         return None
-    end, closers = points[-1]
-    if raw[end:].strip("` \t\r\n,}]"):
-        return None
-    candidate = raw[:end].rstrip().rstrip(",") + closers
-    try:
-        parsed = json.loads(candidate)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) and parsed else None
+    # Prefer the earliest closed object (first parallel arg), not the longest span.
+    for end, closers in points:
+        candidate = raw[:end].rstrip().rstrip(",") + closers
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    return None
+
+
+def _tool_args_json(raw: str, fallback: dict[str, Any] | None) -> str:
+    """Build a single JSON object string for one tool_use input."""
+    if raw.strip():
+        parsed = _best_json_object(raw)
+        if parsed is not None:
+            return _json_object(parsed)
+        # Last resort: still avoid concatenated multi-object garbage when possible.
+        brace = raw.find("{")
+        if brace >= 0:
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(raw[brace:])
+                if isinstance(parsed, dict):
+                    return _json_object(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return raw.strip()
+    if isinstance(fallback, dict) and fallback:
+        return _json_object(fallback)
+    return "{}"
 
 
 def _json_object(value: dict[str, Any]) -> str:
@@ -396,7 +434,8 @@ class StreamRepairState:
         self.seen_block_indices: set[int] = set()
         self.active_blocks: dict[int, str] = {}
         self.index_remap: dict[int, int] = {}
-        self.tool_buf: dict[str, Any] | None = None
+        # Concurrent tool buffers keyed by downstream index (parallel tool_use).
+        self.tool_bufs: dict[int, dict[str, Any]] = {}
 
     def process(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(payload, dict) or self.failed:
@@ -422,12 +461,12 @@ class StreamRepairState:
             return [], None
         etype = payload.get("type")
 
-        if self.tool_buf is not None:
-            if etype == "ping":
-                return [{"type": "ping"}], None
-            if not self._is_tool_continuation(payload):
-                return self._flush_tool(), payload
-            return self._buffer_tool_event(payload), None
+        # Route tool deltas/stops to the matching concurrent buffer.
+        if etype in {"content_block_delta", "content_block_stop"} and self.tool_bufs:
+            upstream = payload.get("index")
+            idx = self.index_remap.get(upstream, upstream)
+            if idx in self.tool_bufs:
+                return self._buffer_tool_event(payload, idx), None
 
         if etype == "ping":
             return ([{"type": "ping"}], None) if self.started else ([], None)
@@ -496,8 +535,8 @@ class StreamRepairState:
         if self.finished:
             return []
         out = self._ensure_started()
-        if self.tool_buf is not None:
-            out.extend(self._flush_tool())
+        if self.tool_bufs:
+            out.extend(self._flush_all_tools())
         out.extend(self._close_open_blocks())
         if not self.any_block_emitted:
             out.append(
@@ -544,16 +583,6 @@ class StreamRepairState:
             }
         ]
 
-    def _is_tool_continuation(self, payload: dict[str, Any]) -> bool:
-        if self.tool_buf is None:
-            return False
-        etype = payload.get("type")
-        if etype not in {"content_block_delta", "content_block_stop"}:
-            return False
-        upstream = payload.get("index")
-        idx = self.index_remap.get(upstream, upstream)
-        return idx == self.tool_buf["index"]
-
     def _on_block_start(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         upstream = payload.get("index")
         block = payload.get("content_block")
@@ -571,9 +600,13 @@ class StreamRepairState:
             logger.warning(
                 "force-closing open content block index %s before reuse", mapped
             )
-            out.append({"type": "content_block_stop", "index": mapped})
-            self.active_blocks.pop(mapped, None)
-            idx = mapped
+            if mapped in self.tool_bufs:
+                out.extend(self._flush_tool(mapped))
+            else:
+                out.append({"type": "content_block_stop", "index": mapped})
+                self.active_blocks.pop(mapped, None)
+            # Never reuse a completed tool index for a new block — allocate fresh.
+            idx = (max(self.seen_block_indices) + 1) if self.seen_block_indices else 0
         elif mapped is not None or upstream in self.seen_block_indices:
             idx = (max(self.seen_block_indices) + 1) if self.seen_block_indices else 0
             logger.warning(
@@ -605,7 +638,17 @@ class StreamRepairState:
                 fallback = _best_json_object(fallback)
             if not isinstance(fallback, dict) or not fallback:
                 fallback = None
-            self.tool_buf = {"index": idx, "parts": [], "fallback": fallback}
+            # If this index somehow still has a buffer, flush it first.
+            if idx in self.tool_bufs:
+                out.extend(self._flush_tool(idx))
+            self.tool_bufs[idx] = {
+                "index": idx,
+                "id": tool_id,
+                "name": tool_name,
+                "parts": [],
+                "fallback": fallback,
+                "started": True,
+            }
             self.active_blocks[idx] = "tool_use"
             self.any_block_emitted = True
             out.append(
@@ -633,36 +676,44 @@ class StreamRepairState:
         out.append(payload)
         return out
 
-    def _buffer_tool_event(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        assert self.tool_buf is not None
+    def _buffer_tool_event(
+        self, payload: dict[str, Any], idx: int
+    ) -> list[dict[str, Any]]:
+        buf = self.tool_bufs.get(idx)
+        if buf is None:
+            return []
         etype = payload.get("type")
         if etype == "content_block_delta":
             delta = payload.get("delta")
             if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
                 part = delta.get("partial_json", "")
-                self.tool_buf["parts"].append(
-                    part if isinstance(part, str) else str(part)
-                )
+                buf["parts"].append(part if isinstance(part, str) else str(part))
             return []
         if etype == "content_block_stop":
-            return self._flush_tool()
+            return self._flush_tool(idx)
         return []
 
-    def _flush_tool(self) -> list[dict[str, Any]]:
-        buf = self.tool_buf
-        self.tool_buf = None
+    def _flush_all_tools(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for index in sorted(self.tool_bufs):
+            out.extend(self._flush_tool(index))
+        return out
+
+    def _flush_tool(self, index: int | None = None) -> list[dict[str, Any]]:
+        if index is None:
+            return self._flush_all_tools()
+        buf = self.tool_bufs.pop(index, None)
         if buf is None:
             return []
-        index = buf["index"]
         self.active_blocks.pop(index, None)
         raw = "".join(buf["parts"])
-        if raw.strip():
-            parsed = _best_json_object(raw)
-            partial = _json_object(parsed) if parsed is not None else raw
-        elif isinstance(buf.get("fallback"), dict):
-            partial = _json_object(buf["fallback"])
-        else:
-            partial = "{}"
+        partial = _tool_args_json(
+            raw, buf["fallback"] if isinstance(buf.get("fallback"), dict) else None
+        )
+        # Drop empty / useless tool calls that would only produce invalid UI noise.
+        if partial in ("{}", "null", "[]") and not raw.strip() and not buf.get("fallback"):
+            logger.warning("dropping empty tool_use %s (%s)", buf.get("name"), index)
+            return []
         self.emitted_tool = True
         self.any_block_emitted = True
         return [
@@ -715,6 +766,9 @@ class StreamRepairState:
     def _on_block_stop(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         upstream = payload.get("index")
         idx = self.index_remap.get(upstream, upstream)
+        # Tool stops are handled by the tool_bufs path; this is for text/thinking.
+        if idx in self.tool_bufs:
+            return self._flush_tool(idx)
         block_type = self.active_blocks.pop(idx, None)
         if block_type is None:
             return []
@@ -898,7 +952,7 @@ async def _stream_gen(kw: dict[str, Any], extra_headers: dict[str, str]):
         yield item
 
 
-app = FastAPI(title="AgentRouter Anthropic Proxy", version="5.1.1")
+app = FastAPI(title="AgentRouter Anthropic Proxy", version="5.2.0")
 
 
 @app.get("/health")
